@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   createDecartClient,
   models,
@@ -34,7 +34,20 @@ import {
   VolumeX,
   Sliders,
   ShieldCheck,
+  Crop,
+  Activity,
+  Lock,
+  KeyRound,
+  LogOut,
+  Monitor,
+  Layers,
+  Video,
 } from 'lucide-react';
+import { VideoCropper, type CropRect } from './VideoCropper';
+import { AdminLoginModal } from './AdminLoginModal';
+import { AdminDashboardModal } from './AdminDashboardModal';
+import { AdminLabsPanel } from './AdminLabsPanel';
+import { diagnosticLogger, type DiagnosticSource } from './diagnosticLogger';
 
 const FULL_APPEARANCE_BASE_INSTRUCTION =
   'Transform the person into the character in the reference image, full body. Synthesize matching arms and hands perfectly tailored to the character skin tone, age, gender and clothing. Strict anti-passthrough: eliminate raw camera background hands, silhouette bleed-through or ghosting artifacts. Ensure temporal consistency and fluid natural motion. ';
@@ -110,7 +123,7 @@ export interface SimliPresetFace {
 const SIMLI_PRESET_FACES: SimliPresetFace[] = [
   {
     id: 'simli-jenna',
-    name: 'Jenna (Officiel Simli)',
+    name: 'Jenna (Studio HD)',
     role: 'Avatar HD Temps Réel',
     faceId: 'tmp9i8bbq7c',
   },
@@ -262,9 +275,84 @@ export default function App() {
   const [isMirrored, setIsMirrored] = useState<boolean>(false);
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
   const [cleanVcamMode, setCleanVcamMode] = useState<boolean>(false);
+  const [isCropperEnabled, setIsCropperEnabled] = useState<boolean>(true);
+  const [showCropSettings, setShowCropSettings] = useState<boolean>(false);
+  const [streamCrop, setStreamCrop] = useState<CropRect>({ x: 0, y: 0, width: 100, height: 100 });
+  const [bottomSafety, setBottomSafety] = useState<number>(0);
+  const [enableSmartRecon, setEnableSmartRecon] = useState<boolean>(true);
+  const [lockCrop, setLockCrop] = useState<boolean>(false);
+  const [remoteVideoEl, setRemoteVideoEl] = useState<HTMLVideoElement | null>(null);
+
+  // Authentification Administrateur Discrète (Triple-clic sur le logo)
+  const [isAdmin, setIsAdmin] = useState<boolean>(() => {
+    try {
+      return sessionStorage.getItem('facevo_admin_auth') === 'true';
+    } catch {
+      return false;
+    }
+  });
+  const [isLoginModalOpen, setIsLoginModalOpen] = useState<boolean>(false);
+  const [isAdminDashboardOpen, setIsAdminDashboardOpen] = useState<boolean>(false);
+  const [isAdminLabsOpen, setIsAdminLabsOpen] = useState<boolean>(false);
+  const logoClicksRef = useRef<number[]>([]);
+
+  const handleLogoClick = () => {
+    const now = Date.now();
+    // Enregistre et filtre les clics récents (moins de 750ms)
+    const recent = logoClicksRef.current.filter((t) => now - t < 750);
+    recent.push(now);
+    logoClicksRef.current = recent;
+    if (recent.length >= 3) {
+      logoClicksRef.current = [];
+      if (!isAdmin) {
+        setIsLoginModalOpen(true);
+      } else {
+        setIsAdminLabsOpen((prev) => !prev);
+      }
+    }
+  };
+
+  const handleAdminLogout = () => {
+    try {
+      sessionStorage.removeItem('facevo_admin_auth');
+    } catch {}
+    setIsAdmin(false);
+    setIsAdminDashboardOpen(false);
+    setIsAdminLabsOpen(false);
+    diagnosticLogger.log({
+      level: 'info',
+      source: 'AUTH_ADMIN',
+      message: 'Déconnexion administrateur effectuée.',
+      targetScript: 'src/App.tsx',
+    });
+  };
+
+  const reportSystemError = (
+    source: DiagnosticSource,
+    rawMsg: string,
+    targetScript: string,
+    remedy?: string
+  ) => {
+    diagnosticLogger.log({
+      level: 'error',
+      source,
+      message: rawMsg,
+      targetScript,
+      recommendedAction: remedy,
+    });
+    setLastDisconnectError(
+      isAdmin
+        ? rawMsg
+        : 'La session en direct a été interrompue. Veuillez réessayer dans quelques instants ou basculer de mode.'
+    );
+  };
 
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
+  const setRemoteVideoRef = useCallback((node: HTMLVideoElement | null) => {
+    remoteVideoRef.current = node;
+    setRemoteVideoEl(node);
+  }, []);
   const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
@@ -309,14 +397,31 @@ export default function App() {
       if (simliRes.ok) {
         const sData: SimliStatus = await simliRes.json();
         setSimliStatus(sData);
+        if (sData.configured && sData.valid) {
+          diagnosticLogger.updateHealth('simliApi', {
+            status: 'healthy',
+            summary: `Clé Simli opérationnelle (${sData.secretName || 'Simli'})`,
+          });
+        }
       }
 
       if (decartRes.ok) {
         const dData: DecartStatus = await decartRes.json();
         setDecartStatus(dData);
+        if (dData.configured && dData.creditsOk) {
+          diagnosticLogger.updateHealth('decartApi', {
+            status: 'healthy',
+            summary: `Cluster GPU Decart actif (${dData.pool || 'gpu-cluster'})`,
+          });
+        }
       }
-    } catch {
-      // Ignore
+    } catch (err) {
+      diagnosticLogger.log({
+        level: 'warn',
+        source: 'SERVER_API',
+        message: 'Échec de rafraîchissement des statuts de clés',
+        details: err,
+      });
     } finally {
       setCheckingKeys(false);
     }
@@ -376,7 +481,11 @@ export default function App() {
         const track = stream.getAudioTracks()[0];
         if (track) {
           await simliClientRef.current.attachMicrophoneTrack(track).catch(() => {});
-          setStatusBanner('Microphone branché en direct sur l’avatar Simli !');
+          setStatusBanner(
+            isAdmin
+              ? 'Microphone branché en direct sur l’avatar Simli !'
+              : 'Microphone connecté à l’avatar !'
+          );
         }
       }
 
@@ -678,10 +787,14 @@ export default function App() {
         {
           onConnected: () => {
             setConnectionState('generating');
+            diagnosticLogger.updateHealth('webrtcStream', {
+              status: 'healthy',
+              summary: 'Session WebRTC Simli connectée et active',
+            });
             setStatusBanner(
               activeMic
-                ? 'Simli Live connecté ! Parlez dans votre micro pour animer l’avatar en temps réel.'
-                : 'Simli Live connecté ! Cliquez sur « Tester le mouvement des lèvres » à gauche ou rafraîchissez (F5) pour autoriser le micro.'
+                ? (isAdmin ? 'Simli Live connecté ! Micro actif.' : 'Studio Voix connecté ! Parlez dans votre micro.')
+                : (isAdmin ? 'Simli Live connecté ! Micro non détecté.' : 'Studio Voix connecté ! Activez le micro ou testez le son.')
             );
           },
           onDisconnected: () => {
@@ -692,7 +805,12 @@ export default function App() {
           onSilent: () => setSimliSpeaking(false),
           onError: (errMsg) => {
             setConnectionState('disconnected');
-            setLastDisconnectError(`Erreur Simli : ${errMsg}`);
+            reportSystemError(
+              'WEBRTC_SIMLI',
+              `Erreur WebRTC Simli : ${errMsg}`,
+              'src/simliWebrtc.ts',
+              'Vérifier la connectivité réseau UDP et la validité du jeton Simli.'
+            );
           },
         }
       );
@@ -709,8 +827,11 @@ export default function App() {
       simliClientRef.current = simliClient;
     } catch (err) {
       setConnectionState('disconnected');
-      setLastDisconnectError(
-        err instanceof Error ? err.message : String(err)
+      reportSystemError(
+        'WEBRTC_SIMLI',
+        err instanceof Error ? err.message : String(err),
+        'server.ts (/api/simli-session) ou src/simliWebrtc.ts',
+        'Vérifier la clé API Simli dans les Secrets d\'environnement (nom : Simli).'
       );
     }
   };
@@ -733,7 +854,11 @@ export default function App() {
       pcm[i] = Math.round(envelope * carrier * 18000);
     }
     client.sendRawPcm16(new Uint8Array(pcm.buffer));
-    setStatusBanner('Signal vocal de test envoyé à l’avatar Simli !');
+    setStatusBanner(
+      isAdmin
+        ? 'Signal vocal de test envoyé à l’avatar Simli !'
+        : 'Signal audio de test envoyé !'
+    );
   };
 
   // --- Démarrage Moteur DECART AI ---
@@ -826,16 +951,28 @@ export default function App() {
       rtClient.on('sessionEnded', ({ reason }) => {
         setConnectionState('disconnected');
         if (reason === 'insufficient_credits' || reason === 'policy_violation') {
-          setLastDisconnectError(
-            'Le serveur Decart AI a coupé la session ("Insufficient credits" — Solde à 0,00 $). Basculez sur le moteur Simli (10 $ gratuits sans SMS) en haut de l’écran !'
+          reportSystemError(
+            'DECART_CLIENT',
+            'Le serveur GPU Decart AI a coupé la session ("Insufficient credits" — Solde à 0,00 $).',
+            'server.ts (/api/decart-status)',
+            'Recharger les crédits sur https://api.decart.ai ou basculer sur le Studio Voix.'
           );
         } else {
-          setLastDisconnectError(`Session terminée par le serveur (${reason}).`);
+          reportSystemError(
+            'DECART_CLIENT',
+            `Session terminée par le serveur GPU (${reason}).`,
+            '@decartai/sdk'
+          );
         }
       });
 
       rtClient.on('error', (err) => {
-        setLastDisconnectError(`Erreur WebRTC : ${err.message}`);
+        reportSystemError(
+          'DECART_CLIENT',
+          `Erreur WebRTC GPU : ${err.message}`,
+          '@decartai/sdk',
+          'Vérifier le flux de la webcam et les paramètres de résolution.'
+        );
       });
 
       realtimeClientRef.current = rtClient;
@@ -843,11 +980,19 @@ export default function App() {
       setConnectionState('disconnected');
       const rawMsg = error instanceof Error ? error.message : String(error);
       if (rawMsg.includes('1008') || rawMsg.toLowerCase().includes('insufficient')) {
-        setLastDisconnectError(
-          'Decart AI a refusé la session car le solde Decart est à 0,00 $ ("Insufficient credits"). Utilisez le moteur Simli (10 $ gratuits à l’inscription sans SMS) sélectionné en haut !'
+        reportSystemError(
+          'DECART_CLIENT',
+          'Decart AI a refusé la session car le solde Decart est à 0,00 $ ("Insufficient credits" Code 1008).',
+          'server.ts (/api/realtime-token)',
+          'Recharger les crédits sur api.decart.ai ou basculer sur le Studio Voix.'
         );
       } else {
-        setLastDisconnectError(`Connexion interrompue : ${rawMsg}`);
+        reportSystemError(
+          'DECART_CLIENT',
+          `Connexion interrompue : ${rawMsg}`,
+          'src/App.tsx (startDecartLive)',
+          'Vérifier la réponse de /api/realtime-token.'
+        );
       }
     }
   };
@@ -931,17 +1076,27 @@ export default function App() {
 
       {/* Top Bar Contrat 3 Zones */}
       <header className="h-14 border-b border-white/10 bg-[#11141B] px-4 sm:px-5 flex items-center justify-between gap-4 shrink-0">
-        <div className="flex items-center gap-3 shrink-0">
-          <div className="w-7 h-7 rounded-lg bg-[#FF5734] flex items-center justify-center font-display font-bold text-white text-sm">
+        <div
+          onClick={handleLogoClick}
+          className="flex items-center gap-3 shrink-0 cursor-pointer select-none group"
+          title={isAdmin ? 'Session Administrateur Active' : 'facEvo Studio'}
+        >
+          <div className="w-7 h-7 rounded-lg bg-[#FF5734] flex items-center justify-center font-display font-bold text-white text-sm transition-transform active:scale-95 group-hover:shadow-[0_0_12px_rgba(255,87,52,0.4)]">
             fE
           </div>
           <span className="font-display font-bold text-base tracking-tight text-white whitespace-nowrap">
             fac<span className="text-[#FF5734]">Evo</span> Direct Studio
           </span>
+          {isAdmin && (
+            <span className="px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 text-[10px] font-mono font-bold flex items-center gap-1 shadow-sm">
+              <ShieldCheck className="w-3 h-3 text-emerald-400" />
+              ADMIN
+            </span>
+          )}
         </div>
 
-        {/* Sélecteur de moteur en 1 clic : Simli (10$ Gratuits) vs Decart AI */}
-        <div className="flex items-center gap-1 rounded-xl bg-[#0B0D11] border border-white/10 p-1">
+        {/* INTITULÉS DE NAVIGATION PUBLICS ÉPURÉS */}
+        <nav className="hidden md:flex items-center gap-2 text-xs font-semibold text-slate-400">
           <button
             type="button"
             disabled={isLiveRunning}
@@ -949,13 +1104,12 @@ export default function App() {
               setActiveEngine('simli');
               setLastDisconnectError(null);
             }}
-            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors flex items-center gap-1.5 whitespace-nowrap ${
-              activeEngine === 'simli'
-                ? 'bg-[#FF5734] text-white'
-                : 'text-slate-400 hover:text-white'
+            className={`hover:text-white cursor-pointer transition-colors flex items-center gap-1.5 px-3 py-1.5 rounded-lg ${
+              activeEngine === 'simli' ? 'text-white bg-white/10 border border-white/15' : 'text-slate-400'
             }`}
           >
-            <span>Moteur Simli (10 $ Gratuits · Sans SMS)</span>
+            <Sparkles className="w-3.5 h-3.5 text-[#FF5734]" />
+            <span>Studio Voix & Lèvres (HD)</span>
           </button>
           <button
             type="button"
@@ -964,29 +1118,71 @@ export default function App() {
               setActiveEngine('decart');
               setLastDisconnectError(null);
             }}
-            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors flex items-center gap-1.5 whitespace-nowrap ${
-              activeEngine === 'decart'
-                ? 'bg-[#FF5734] text-white'
-                : 'text-slate-400 hover:text-white'
+            className={`hover:text-white cursor-pointer transition-colors flex items-center gap-1.5 px-3 py-1.5 rounded-lg ${
+              activeEngine === 'decart' ? 'text-white bg-white/10 border border-white/15' : 'text-slate-400'
             }`}
           >
-            <span>Moteur Decart AI (Lucy 2.5)</span>
+            <Video className="w-3.5 h-3.5 text-[#FF5734]" />
+            <span>Studio Visage & Rendu</span>
           </button>
-        </div>
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            className="hover:text-white cursor-pointer transition-colors flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-slate-400 hover:bg-white/5"
+            title="Importer ou changer la photo de référence de l’avatar"
+          >
+            <Layers className="w-3.5 h-3.5 text-[#FF5734]" />
+            <span>Choix de l’Avatar Photoréaliste</span>
+          </button>
+        </nav>
 
+        {/* BARRE D'ACTIONS HEADER */}
         <div className="flex items-center gap-2.5 shrink-0">
           <span className="hidden sm:inline text-xs font-mono tabular-nums text-slate-400">
             {formatTimer(liveSeconds)}
           </span>
-          <button
-            type="button"
-            onClick={checkAllStatuses}
-            disabled={checkingKeys}
-            className="px-3 py-1.5 rounded-lg bg-[#1A202C] hover:bg-[#242B3B] border border-white/10 text-white text-xs font-medium transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0"
-          >
-            <RefreshCw className={`w-3.5 h-3.5 text-emerald-400 ${checkingKeys ? 'animate-spin' : ''}`} />
-            <span>Vérifier ma clé</span>
-          </button>
+
+          {isAdmin ? (
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setIsAdminLabsOpen((prev) => !prev)}
+                className={`px-3 py-1.5 rounded-xl border text-xs font-semibold flex items-center gap-1.5 transition-colors ${
+                  isAdminLabsOpen
+                    ? 'bg-indigo-500/20 border-indigo-500/40 text-indigo-300'
+                    : 'bg-white/5 border-white/10 text-slate-300 hover:text-white'
+                }`}
+                title="Ouvrir la console Labs et de supervision technique"
+              >
+                <Activity className="w-3.5 h-3.5 text-indigo-400" />
+                <span>Labs & Diagnostic</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setIsAdminDashboardOpen(true)}
+                className="px-3 py-1.5 rounded-xl bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/30 text-emerald-300 text-xs font-semibold transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0 shadow-sm"
+              >
+                <Activity className="w-3.5 h-3.5 text-emerald-400" />
+                <span className="hidden sm:inline">Réglages</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handleAdminLogout}
+                className="px-3 py-1.5 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 hover:bg-rose-500/20 text-xs font-semibold flex items-center gap-1.5 transition-colors"
+                title="Déconnexion Administrateur"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Déconnexion</span>
+              </button>
+            </div>
+          ) : (
+            <div className="text-[11px] font-medium text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-3 py-1 rounded-full flex items-center gap-1.5">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+              <span>Studio Prêt</span>
+            </div>
+          )}
         </div>
       </header>
 
@@ -1068,7 +1264,7 @@ export default function App() {
                   )}
                 </div>
 
-                {/* 2. Configuration de l'Avatar Simli */}
+                {/* 2. Configuration de l'Avatar */}
                 <section className="rounded-2xl border border-white/10 bg-[#12161F] p-3.5 flex-1 flex flex-col justify-between gap-3">
                   <div className="space-y-3.5">
                     <div className="flex items-center justify-between border-b border-white/10 pb-2.5">
@@ -1076,16 +1272,16 @@ export default function App() {
                         <Sparkles className="w-4 h-4 text-[#FF7A5C]" />
                         <div>
                           <h2 className="text-xs font-semibold text-white">
-                            2. Avatar Photoréaliste Simli
+                            {isAdmin ? '2. Avatar Photoréaliste (Simli Engine)' : '2. Choix de l’Avatar Photoréaliste'}
                           </h2>
                           <p className="text-[11px] text-slate-400">
-                            Synchronisation labiale & mouvements 3D (&lt; 250 ms)
+                            Synchronisation labiale haute fidélité en temps réel
                           </p>
                         </div>
                       </div>
                     </div>
 
-                    {/* Choix d'avatars officiels prêts à l'emploi */}
+                    {/* Choix d'avatars prêts à l'emploi */}
                     <div className="space-y-1.5">
                       <label className="block text-[11px] text-slate-300 font-medium">
                         Avatars HD prêts à l&rsquo;emploi :
@@ -1107,7 +1303,7 @@ export default function App() {
                             >
                               <p className="text-xs font-semibold truncate">{preset.name}</p>
                               <p className="text-[10px] text-slate-400 font-mono truncate">
-                                {preset.faceId.slice(0, 11)}…
+                                {isAdmin ? preset.faceId.slice(0, 11) + '…' : preset.role}
                               </p>
                             </button>
                           );
@@ -1115,77 +1311,81 @@ export default function App() {
                       </div>
                     </div>
 
-                    {/* Champ Face ID personnalisé (depuis app.simli.com) */}
-                    <div className="space-y-1.5">
-                      <div className="flex items-center justify-between text-[11px]">
-                        <span className="text-slate-300 font-medium">
-                          Ou collez votre propre <code className="font-mono text-[#FF7A5C]">faceId</code> :
-                        </span>
-                        <a
-                          href="https://app.simli.com"
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-[#FF7A5C] hover:underline flex items-center gap-1"
-                        >
-                          <span>Créer sur Simli</span>
-                          <ExternalLink className="w-3 h-3" />
-                        </a>
-                      </div>
-                      <input
-                        type="text"
-                        value={simliFaceId}
-                        disabled={isLiveRunning}
-                        onChange={(e) => setSimliFaceId(e.target.value)}
-                        placeholder="Ex: tmp9i8bbq7c"
-                        className="w-full rounded-xl border border-white/10 bg-[#0B0D11] px-3 py-2 text-xs font-mono text-white focus:outline-none focus:border-[#FF5734]"
-                      />
-                    </div>
+                    {/* Contrôles Avancés réservés à l'Administrateur */}
+                    {isAdmin && (
+                      <>
+                        <div className="space-y-1.5 pt-2 border-t border-white/10">
+                          <div className="flex items-center justify-between text-[11px]">
+                            <span className="text-slate-300 font-medium">
+                              Identifiant technique <code className="font-mono text-[#FF7A5C]">faceId</code> :
+                            </span>
+                            <a
+                              href="https://app.simli.com"
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-[#FF7A5C] hover:underline flex items-center gap-1"
+                            >
+                              <span>Console Simli</span>
+                              <ExternalLink className="w-3 h-3" />
+                            </a>
+                          </div>
+                          <input
+                            type="text"
+                            value={simliFaceId}
+                            disabled={isLiveRunning}
+                            onChange={(e) => setSimliFaceId(e.target.value)}
+                            placeholder="Ex: tmp9i8bbq7c"
+                            className="w-full rounded-xl border border-white/10 bg-[#0B0D11] px-3 py-2 text-xs font-mono text-white focus:outline-none focus:border-[#FF5734]"
+                          />
+                        </div>
 
-                    <div className="grid grid-cols-2 gap-2">
-                      <div className="p-2 rounded-xl bg-[#0B0D11] border border-white/10">
-                        <label className="block text-[10px] text-slate-400 mb-0.5">
-                          Modèle Lip-Sync
-                        </label>
-                        <select
-                          value={simliModel}
-                          disabled={isLiveRunning}
-                          onChange={(e) =>
-                            setSimliModel(e.target.value as 'fasttalk' | 'artalk')
-                          }
-                          className="w-full bg-transparent text-xs font-semibold text-white focus:outline-none"
-                        >
-                          <option value="fasttalk" className="bg-[#12161F]">
-                            FastTalk (Ultra-rapide)
-                          </option>
-                          <option value="artalk" className="bg-[#12161F]">
-                            ArtTalk (Expressif)
-                          </option>
-                        </select>
-                      </div>
+                        <div className="grid grid-cols-2 gap-2">
+                          <div className="p-2 rounded-xl bg-[#0B0D11] border border-white/10">
+                            <label className="block text-[10px] text-slate-400 mb-0.5">
+                              Modèle Lip-Sync
+                            </label>
+                            <select
+                              value={simliModel}
+                              disabled={isLiveRunning}
+                              onChange={(e) =>
+                                setSimliModel(e.target.value as 'fasttalk' | 'artalk')
+                              }
+                              className="w-full bg-transparent text-xs font-semibold text-white focus:outline-none"
+                            >
+                              <option value="fasttalk" className="bg-[#12161F]">
+                                FastTalk (Ultra-rapide)
+                              </option>
+                              <option value="artalk" className="bg-[#12161F]">
+                                ArtTalk (Expressif)
+                              </option>
+                            </select>
+                          </div>
 
-                      <div className="p-2 rounded-xl bg-[#0B0D11] border border-white/10">
-                        <label className="block text-[10px] text-slate-400 mb-0.5">
-                          Canal WebRTC
-                        </label>
-                        <select
-                          value={simliTransport}
-                          disabled={isLiveRunning}
-                          onChange={(e) =>
-                            setSimliTransport(e.target.value as 'p2p' | 'livekit')
-                          }
-                          className="w-full bg-transparent text-xs font-semibold text-emerald-400 focus:outline-none"
-                        >
-                          <option value="p2p" className="bg-[#12161F]">
-                            P2P SFU (Direct)
-                          </option>
-                          <option value="livekit" className="bg-[#12161F]">
-                            LiveKit Cloud
-                          </option>
-                        </select>
-                      </div>
-                    </div>
+                          <div className="p-2 rounded-xl bg-[#0B0D11] border border-white/10">
+                            <label className="block text-[10px] text-slate-400 mb-0.5">
+                              Canal WebRTC
+                            </label>
+                            <select
+                              value={simliTransport}
+                              disabled={isLiveRunning}
+                              onChange={(e) =>
+                                setSimliTransport(e.target.value as 'p2p' | 'livekit')
+                              }
+                              className="w-full bg-transparent text-xs font-semibold text-emerald-400 focus:outline-none"
+                            >
+                              <option value="p2p" className="bg-[#12161F]">
+                                P2P SFU (Direct)
+                              </option>
+                              <option value="livekit" className="bg-[#12161F]">
+                                LiveKit Cloud
+                              </option>
+                            </select>
+                          </div>
+                        </div>
+                      </>
+                    )}
 
-                    {isLiveRunning && (
+                    {(isLiveRunning || isAdmin) && (
                       <button
                         type="button"
                         onClick={sendSimliDemoVoicePulse}
@@ -1196,24 +1396,32 @@ export default function App() {
                     )}
                   </div>
 
-                  <div className="pt-2 border-t border-white/10 space-y-1">
-                    {simliStatus.configured ? (
-                      <div className="flex items-center gap-1.5 text-[11px] text-emerald-400">
-                        <Check className="w-3.5 h-3.5 shrink-0" />
-                        <span>
-                          Clé Simli &ldquo;{simliStatus.secretName}&rdquo; ({simliStatus.keyPrefix}) prête ✓
-                        </span>
+                  {isAdmin ? (
+                    <div className="pt-2 border-t border-white/10 space-y-1">
+                      {simliStatus.configured ? (
+                        <div className="flex items-center gap-1.5 text-[11px] text-emerald-400">
+                          <Check className="w-3.5 h-3.5 shrink-0" />
+                          <span>
+                            Clé Simli &ldquo;{simliStatus.secretName}&rdquo; ({simliStatus.keyPrefix}) prête ✓
+                          </span>
+                        </div>
+                      ) : (
+                        <div className="flex items-center gap-1.5 text-[11px] text-amber-400">
+                          <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                          <span>Clé Simli à ajouter dans Secrets (nom : Simli)</span>
+                        </div>
+                      )}
+                      {statusBanner && (
+                        <p className="text-[11px] text-slate-300 leading-snug">{statusBanner}</p>
+                      )}
+                    </div>
+                  ) : (
+                    statusBanner && (
+                      <div className="pt-2 border-t border-white/10">
+                        <p className="text-[11px] text-slate-300 leading-snug">{statusBanner}</p>
                       </div>
-                    ) : (
-                      <div className="flex items-center gap-1.5 text-[11px] text-amber-400">
-                        <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
-                        <span>Clé Simli à ajouter dans Secrets (nom : Simli)</span>
-                      </div>
-                    )}
-                    {statusBanner && (
-                      <p className="text-[11px] text-slate-300 leading-snug">{statusBanner}</p>
-                    )}
-                  </div>
+                    )
+                  )}
                 </section>
               </>
             ) : (
@@ -1280,59 +1488,61 @@ export default function App() {
                         <Sparkles className="w-4 h-4 text-[#FF7A5C]" />
                         <div>
                           <h2 className="text-xs font-semibold text-white">
-                            2. Transformer (Decart Lucy 2.5)
+                            {isAdmin ? '2. Transformer (Decart Lucy 2.5)' : '2. Personnalisation & Posture'}
                           </h2>
                           <p className="text-[11px] text-slate-400">
-                            Personnage, tenue, lèvres & décor
+                            Personnage, tenue, gestes &amp; décor
                           </p>
                         </div>
                       </div>
                     </div>
 
-                    <div className="grid grid-cols-2 gap-2">
-                      <div className="p-2 rounded-xl bg-[#0B0D11] border border-white/10">
-                        <label className="block text-[10px] text-slate-400 mb-0.5">
-                          Modèle Decart AI
-                        </label>
-                        <select
-                          value={selectedModel}
-                          onChange={(e) => setSelectedModel(e.target.value as RealTimeModels)}
-                          disabled={isLiveRunning}
-                          className="w-full bg-transparent text-xs font-semibold text-white focus:outline-none"
-                        >
-                          <option value="lucy-2.1" className="bg-[#12161F]">
-                            Lucy 2.1 (Ultra-Fluide · 30 FPS)
-                          </option>
-                          <option value="lucy-2.5" className="bg-[#12161F]">
-                            Lucy 2.5 (HD · Photoréaliste)
-                          </option>
-                          <option value="lucy-vton-3.6" className="bg-[#12161F]">
-                            Lucy VTON 3.6 (Tenue)
-                          </option>
-                        </select>
-                      </div>
+                    {isAdmin && (
+                      <div className="grid grid-cols-2 gap-2">
+                        <div className="p-2 rounded-xl bg-[#0B0D11] border border-white/10">
+                          <label className="block text-[10px] text-slate-400 mb-0.5">
+                            Modèle Decart AI
+                          </label>
+                          <select
+                            value={selectedModel}
+                            onChange={(e) => setSelectedModel(e.target.value as RealTimeModels)}
+                            disabled={isLiveRunning}
+                            className="w-full bg-transparent text-xs font-semibold text-white focus:outline-none"
+                          >
+                            <option value="lucy-2.1" className="bg-[#12161F]">
+                              Lucy 2.1 (Ultra-Fluide · 30 FPS)
+                            </option>
+                            <option value="lucy-2.5" className="bg-[#12161F]">
+                              Lucy 2.5 (HD · Photoréaliste)
+                            </option>
+                            <option value="lucy-vton-3.6" className="bg-[#12161F]">
+                              Lucy VTON 3.6 (Tenue)
+                            </option>
+                          </select>
+                        </div>
 
-                      <div className="p-2 rounded-xl bg-[#0B0D11] border border-white/10">
-                        <label className="block text-[10px] text-slate-400 mb-0.5">
-                          Codec Vidéo Matériel
-                        </label>
-                        <select
-                          value={preferredCodec}
-                          onChange={(e) =>
-                            setPreferredCodec(e.target.value as 'vp8' | 'h264')
-                          }
-                          disabled={isLiveRunning}
-                          className="w-full bg-transparent text-xs font-semibold text-emerald-400 focus:outline-none"
-                        >
-                          <option value="h264" className="bg-[#12161F]">
-                            H.264 (Accéléré GPU · Fluide)
-                          </option>
-                          <option value="vp8" className="bg-[#12161F]">
-                            VP8 (Logiciel)
-                          </option>
-                        </select>
+                        <div className="p-2 rounded-xl bg-[#0B0D11] border border-white/10">
+                          <label className="block text-[10px] text-slate-400 mb-0.5">
+                            Codec Vidéo Matériel
+                          </label>
+                          <select
+                            value={preferredCodec}
+                            onChange={(e) =>
+                              setPreferredCodec(e.target.value as 'vp8' | 'h264')
+                            }
+                            disabled={isLiveRunning}
+                            className="w-full bg-transparent text-xs font-semibold text-emerald-400 focus:outline-none"
+                          >
+                            <option value="h264" className="bg-[#12161F]">
+                              H.264 (Accéléré GPU · Fluide)
+                            </option>
+                            <option value="vp8" className="bg-[#12161F]">
+                              VP8 (Logiciel)
+                            </option>
+                          </select>
+                        </div>
                       </div>
-                    </div>
+                    )}
 
                     <div
                       className="flex gap-1 rounded-lg border border-white/10 bg-[#0B0D11] p-1"
@@ -1523,15 +1733,17 @@ export default function App() {
                     )}
                   </div>
 
-                  <div className="pt-2 border-t border-white/10 space-y-1">
-                    <div className="flex items-center gap-1.5 text-[11px] text-emerald-400">
-                      <Check className="w-3.5 h-3.5 shrink-0" />
-                      <span>
-                        Clé Decart &ldquo;{decartStatus.apiKeyName || 'Live'}&rdquo; (
-                        {decartStatus.keyPrefix || 'dct_live…'}) configurée
-                      </span>
+                  {isAdmin && (
+                    <div className="pt-2 border-t border-white/10 space-y-1">
+                      <div className="flex items-center gap-1.5 text-[11px] text-emerald-400">
+                        <Check className="w-3.5 h-3.5 shrink-0" />
+                        <span>
+                          Clé Decart &ldquo;{decartStatus.apiKeyName || 'Live'}&rdquo; (
+                          {decartStatus.keyPrefix || 'dct_live…'}) configurée
+                        </span>
+                      </div>
                     </div>
-                  </div>
+                  )}
                 </section>
               </>
             )}
@@ -1539,26 +1751,55 @@ export default function App() {
         )}
 
         {/* Zone centrale : Écran vidéo WebRTC Temps Réel */}
-        <div className="flex-1 flex flex-col gap-3 min-w-0 min-h-0">
+        <div className="flex-1 flex flex-col gap-2 min-w-0 min-h-0">
+          <div className="flex items-center justify-between px-2 shrink-0">
+            <h2 className="text-xs font-bold uppercase tracking-wider text-slate-400 flex items-center gap-2">
+              <Monitor className="w-4 h-4 text-[#FF5734]" />
+              <span>Aperçu Vidéo Temps Réel (60 FPS)</span>
+            </h2>
+            <span className="text-[11px] font-mono text-slate-500">
+              Crop : {Math.round(streamCrop.width)}% × {Math.round(streamCrop.height)}%
+            </span>
+          </div>
+
           <div
             className={`flex-1 bg-[#080A0E] rounded-2xl border border-white/10 relative overflow-hidden flex items-center justify-center p-6 ${
               isFullscreen ? 'fixed inset-3 z-50' : ''
             }`}
           >
             <video
-              ref={remoteVideoRef}
+              ref={setRemoteVideoRef}
               autoPlay
               playsInline
               style={{
                 transform: isMirrored ? 'scaleX(-1)' : 'none',
                 transformOrigin: 'center center',
               }}
-              className={`w-full h-full transition-transform duration-200 object-contain ${
-                connectionState === 'generating' || connectionState === 'connected'
-                  ? 'block'
-                  : 'hidden'
-              }`}
+              className={
+                isCropperEnabled && (connectionState === 'generating' || connectionState === 'connected')
+                  ? 'absolute opacity-0 pointer-events-none w-1 h-1'
+                  : `w-full h-full transition-transform duration-200 object-contain ${
+                      connectionState === 'generating' || connectionState === 'connected'
+                        ? 'block'
+                        : 'hidden'
+                    }`
+              }
             />
+
+            {isCropperEnabled && (connectionState === 'generating' || connectionState === 'connected') && (
+              <VideoCropper
+                video={remoteVideoEl}
+                crop={streamCrop}
+                setCrop={setStreamCrop}
+                bottomSafety={bottomSafety}
+                lockCrop={lockCrop}
+                enableSmartReconstruction={enableSmartRecon}
+                storageKey="decart_stream_crop"
+                className={`w-full h-full transition-transform duration-200 ${
+                  isMirrored ? 'scale-x-[-1]' : ''
+                }`}
+              />
+            )}
 
             {isLiveRunning && activeEngine === 'simli' && (
               <div className="absolute top-3.5 left-3.5 z-20 px-3 py-1 rounded-lg bg-[#11141B]/90 border border-white/10 text-xs font-mono text-white flex items-center gap-2">
@@ -1568,7 +1809,11 @@ export default function App() {
                   }`}
                 />
                 <span>
-                  {simliSpeaking ? 'Avatar en train de parler…' : 'Simli Live — À l’écoute du micro'}
+                  {simliSpeaking
+                    ? 'Avatar en train de parler…'
+                    : isAdmin
+                    ? 'Simli Live — À l’écoute du micro'
+                    : 'Studio Voix — À l’écoute du micro'}
                 </span>
               </div>
             )}
@@ -1590,7 +1835,9 @@ export default function App() {
                     <div className="mt-4 flex items-center justify-center">
                       <span className="px-3.5 py-1 rounded-lg bg-[#FF5734] text-[11px] font-semibold text-white tracking-wide shadow-md uppercase">
                         {activeEngine === 'simli'
-                          ? `Simli FaceID : ${simliFaceId.slice(0, 10)}`
+                          ? isAdmin
+                            ? `Simli FaceID : ${simliFaceId.slice(0, 10)}`
+                            : 'Mode Voix : Haute Fidélité'
                           : 'Priorité : Image entière'}
                       </span>
                     </div>
@@ -1628,6 +1875,123 @@ export default function App() {
 
             {/* Barre de contrôles du bas de l'écran vidéo */}
             <div className="absolute bottom-3.5 right-3.5 z-30 flex items-center gap-2">
+              {/* Bouton Panneau Recadrage & Anti-Filigrane */}
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={() => setShowCropSettings(!showCropSettings)}
+                  title="Recadrage & Anti-Filigrane"
+                  className={`flex h-10 items-center gap-1.5 px-3 rounded-xl border text-xs font-medium transition-colors ${
+                    isCropperEnabled
+                      ? 'border-emerald-500/40 bg-emerald-500/20 text-emerald-200 hover:bg-emerald-500/30'
+                      : 'border-white/15 bg-[#11141B]/90 text-slate-300 hover:text-white'
+                  }`}
+                >
+                  <Crop className="w-4 h-4 text-emerald-400" />
+                  <span>Recadrage</span>
+                </button>
+
+                {showCropSettings && (
+                  <div className="absolute bottom-12 right-0 w-72 rounded-2xl border border-white/15 bg-[#11141B]/95 p-3.5 shadow-2xl backdrop-blur-md z-40 text-left space-y-3">
+                    <div className="flex items-center justify-between border-b border-white/10 pb-2">
+                      <span className="text-xs font-bold text-white flex items-center gap-1.5">
+                        <Crop className="w-3.5 h-3.5 text-emerald-400" />
+                        Smart VideoCropper
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setShowCropSettings(false)}
+                        className="text-[10px] text-slate-400 hover:text-white"
+                      >
+                        Fermer
+                      </button>
+                    </div>
+
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="text-slate-300">Activer le recadrage</span>
+                      <button
+                        type="button"
+                        onClick={() => setIsCropperEnabled(!isCropperEnabled)}
+                        className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold transition-colors ${
+                          isCropperEnabled
+                            ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                            : 'bg-white/10 text-slate-400 border border-white/10'
+                        }`}
+                      >
+                        {isCropperEnabled ? 'ACTIF' : 'DÉSACTIVÉ'}
+                      </button>
+                    </div>
+
+                    {isCropperEnabled && (
+                      <>
+                        <div className="space-y-1.5 text-xs">
+                          <div className="flex justify-between text-slate-300">
+                            <span>Rognage bas sécurité :</span>
+                            <span className="font-mono text-emerald-400">{bottomSafety}%</span>
+                          </div>
+                          <div className="flex gap-1.5">
+                            {[0, 5, 8, 12, 16].map((pct) => (
+                              <button
+                                key={pct}
+                                type="button"
+                                onClick={() => setBottomSafety(pct)}
+                                className={`flex-1 py-1 rounded-md text-[10px] font-medium transition-colors ${
+                                  bottomSafety === pct
+                                    ? 'bg-emerald-500 text-white font-bold'
+                                    : 'bg-white/10 text-slate-300 hover:bg-white/15'
+                                }`}
+                              >
+                                {pct}%
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+
+                        <div className="flex items-center justify-between text-xs pt-1 border-t border-white/10">
+                          <div>
+                            <p className="text-slate-200 font-medium">Reconstitution GPU</p>
+                            <p className="text-[10px] text-slate-400">Trame propre mémorisée</p>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => setEnableSmartRecon(!enableSmartRecon)}
+                            className={`px-2 py-1 rounded text-[10px] font-semibold ${
+                              enableSmartRecon
+                                ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                                : 'bg-white/10 text-slate-400'
+                            }`}
+                          >
+                            {enableSmartRecon ? 'ON' : 'OFF'}
+                          </button>
+                        </div>
+
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="text-slate-300">Poignées de recadrage</span>
+                          <button
+                            type="button"
+                            onClick={() => setLockCrop(!lockCrop)}
+                            className={`px-2 py-1 rounded text-[10px] font-medium ${
+                              lockCrop
+                                ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
+                                : 'bg-white/10 text-slate-300'
+                            }`}
+                          >
+                            {lockCrop ? 'Verrouillées' : 'Modifiables'}
+                          </button>
+                        </div>
+
+                        <button
+                          type="button"
+                          onClick={() => setStreamCrop({ x: 0, y: 0, width: 100, height: 100 })}
+                          className="w-full py-1.5 rounded-lg border border-white/15 bg-white/5 hover:bg-white/10 text-[11px] text-slate-300 hover:text-white transition-colors"
+                        >
+                          Réinitialiser la zone (100%)
+                        </button>
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
 
               <button
                 type="button"
@@ -1699,7 +2063,11 @@ export default function App() {
                       <div>
                         <p className="text-xs font-semibold whitespace-nowrap">{av.name}</p>
                         <p className="text-[10px] text-emerald-400 whitespace-nowrap">
-                          {activeEngine === 'simli' ? 'Avatar Simli' : 'Image entière'}
+                          {activeEngine === 'simli'
+                            ? isAdmin
+                              ? 'Avatar Simli'
+                              : 'Avatar Studio'
+                            : 'Image entière'}
                         </p>
                       </div>
                       <button
@@ -1745,8 +2113,12 @@ export default function App() {
                     <Play className="w-3.5 h-3.5 fill-current" />
                     <span>
                       {activeEngine === 'simli'
-                        ? 'Démarrer le Live Simli'
-                        : 'Démarrer le Swap Decart'}
+                        ? isAdmin
+                          ? 'Démarrer le Live Simli'
+                          : 'Démarrer le Studio Voix'
+                        : isAdmin
+                        ? 'Démarrer le Swap Decart'
+                        : 'Démarrer le Studio Visage'}
                     </span>
                   </>
                 )}
@@ -1756,6 +2128,42 @@ export default function App() {
         )}
       </div>
       </main>
+
+      {/* Modale d'authentification discrète pour l'administrateur (Triple-clic sur le logo) */}
+      <AdminLoginModal
+        isOpen={isLoginModalOpen}
+        onClose={() => setIsLoginModalOpen(false)}
+        onSuccess={() => {
+          setIsAdmin(true);
+          setIsAdminLabsOpen(true);
+        }}
+      />
+
+      {/* Console d'Administration & Diagnostic Technique */}
+      <AdminDashboardModal
+        isOpen={isAdminDashboardOpen}
+        onClose={() => setIsAdminDashboardOpen(false)}
+        onLogout={handleAdminLogout}
+        simliStatus={simliStatus}
+        decartStatus={decartStatus}
+        onRefreshStatuses={checkAllStatuses}
+        activeEngine={activeEngine}
+        setActiveEngine={setActiveEngine}
+        simliFaceId={simliFaceId}
+        setSimliFaceId={setSimliFaceId}
+        simliModel={simliModel}
+        setSimliModel={setSimliModel}
+        simliTransport={simliTransport}
+        setSimliTransport={setSimliTransport}
+        decartModel={selectedModel}
+        setDecartModel={setSelectedModel}
+        onSendVoicePulse={sendSimliDemoVoicePulse}
+      />
+
+      {/* Panneau Dédié Labs & Supervision */}
+      {isAdminLabsOpen && (
+        <AdminLabsPanel onClose={() => setIsAdminLabsOpen(false)} />
+      )}
     </div>
   );
 }

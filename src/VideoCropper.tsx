@@ -1,13 +1,9 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 
 export interface CropRect {
-  /** Position X en pourcentage (0 à 100) */
   x: number;
-  /** Position Y en pourcentage (0 à 100) */
   y: number;
-  /** Largeur en pourcentage (0 à 100) */
   width: number;
-  /** Hauteur en pourcentage (0 à 100) */
   height: number;
 }
 
@@ -21,21 +17,15 @@ export interface WatermarkBox {
 }
 
 export interface VideoCropperProps {
-  /** Élément vidéo HTML source ou flux */
   video: HTMLVideoElement | null;
-  /** Zone de recadrage actuelle (en pourcentage 0-100) */
   crop?: CropRect;
-  /** Callback de mise à jour du recadrage */
   setCrop?: (crop: CropRect) => void;
-  /** Marge de sécurité inférieure en pourcentage (0-30%) pour rogner les bandeaux sans déformer l'image */
   bottomSafety?: number;
-  /** Verrouille la modification manuelle de la boîte de recadrage */
   lockCrop?: boolean;
-  /** Classes CSS supplémentaires pour le conteneur */
   className?: string;
-  /** Clé optionnelle pour sauvegarder le crop dans le localStorage */
   storageKey?: string;
-  /** Appelée à chaque frame rendue (utile pour la télémétrie ou l'analyse externe sans blocage) */
+  activeWatermarkBox?: { x: number; y: number; width: number; height: number } | null;
+  enableSmartReconstruction?: boolean;
   onFrame?: (now: DOMHighResTimeStamp, metadata?: VideoFrameCallbackMetadata) => void;
 }
 
@@ -46,13 +36,6 @@ const DEFAULT_CROP: CropRect = {
   height: 100,
 };
 
-/**
- * Composant de recadrage et rendu vidéo ultra-haute performance.
- * Utilise requestVideoFrameCallback (accélération matérielle, synchronisé avec le décodage vidéo)
- * Aucune allocation mémoire dans la boucle de rendu (zéro fuite, zéro garbage collection intempestive)
- * Suppression totale des masques noirs, calques artificiels ou flous destructeurs
- * Protection intégrale du visage et préservation des proportions natives de l'image
- */
 export const VideoCropper: React.FC<VideoCropperProps> = ({
   video,
   crop = DEFAULT_CROP,
@@ -61,16 +44,19 @@ export const VideoCropper: React.FC<VideoCropperProps> = ({
   lockCrop = false,
   className = '',
   storageKey,
+  activeWatermarkBox = null,
+  enableSmartReconstruction = true,
   onFrame,
 }) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  // Maintien des refs pour éviter de recréer les boucles d'animation à chaque render React
+  const cleanSnapshotCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const hasCleanSnapshotRef = useRef<boolean>(false);
+
   const videoRef = useRef<HTMLVideoElement | null>(video);
   videoRef.current = video;
 
-  // Gestion de la persistance locale (localStorage) si une clé est fournie
   const effectiveCrop = React.useMemo(() => {
     if (storageKey && typeof window !== 'undefined') {
       try {
@@ -82,7 +68,7 @@ export const VideoCropper: React.FC<VideoCropperProps> = ({
           }
         }
       } catch (err) {
-        console.warn('Erreur lors de la lecture du localStorage pour le crop:', err);
+        console.warn('Erreur lecture localStorage:', err);
       }
     }
     return crop;
@@ -94,10 +80,15 @@ export const VideoCropper: React.FC<VideoCropperProps> = ({
   const bottomSafetyRef = useRef<number>(bottomSafety);
   bottomSafetyRef.current = Math.max(0, Math.min(30, bottomSafety));
 
+  const watermarkBoxRef = useRef(activeWatermarkBox);
+  watermarkBoxRef.current = activeWatermarkBox;
+
+  const enableReconRef = useRef(enableSmartReconstruction);
+  enableReconRef.current = enableSmartReconstruction;
+
   const onFrameRef = useRef(onFrame);
   onFrameRef.current = onFrame;
 
-  // État local de la souris pour le redimensionnement interactif
   const [isDragging, setIsDragging] = useState<boolean>(false);
   const [dragAction, setDragAction] = useState<'move' | 'nw' | 'ne' | 'se' | 'sw' | null>(null);
   const dragStartRef = useRef<{ mouseX: number; mouseY: number; initialCrop: CropRect }>({
@@ -106,14 +97,13 @@ export const VideoCropper: React.FC<VideoCropperProps> = ({
     initialCrop: effectiveCrop,
   });
 
-  // Fonction de mise à jour synchronisant le parent et le stockage local
   const updateCrop = useCallback(
     (newCrop: CropRect) => {
       if (storageKey && typeof window !== 'undefined') {
         try {
           localStorage.setItem(`videocropper_crop_${storageKey}`, JSON.stringify(newCrop));
         } catch (err) {
-          console.warn("Erreur lors de l'écriture dans le localStorage pour le crop:", err);
+          console.warn('Erreur écriture localStorage:', err);
         }
       }
       if (setCrop) {
@@ -123,7 +113,6 @@ export const VideoCropper: React.FC<VideoCropperProps> = ({
     [storageKey, setCrop]
   );
 
-  // Normalisation sécurisée des valeurs de recadrage (0 - 100%)
   const safeCrop = {
     x: Math.max(0, Math.min(95, effectiveCrop.x || 0)),
     y: Math.max(0, Math.min(95, effectiveCrop.y || 0)),
@@ -131,14 +120,10 @@ export const VideoCropper: React.FC<VideoCropperProps> = ({
     height: Math.max(5, Math.min(100 - (effectiveCrop.y || 0), effectiveCrop.height || 100)),
   };
 
-  /**
-   * Boucle principale de rendu haute performance
-   */
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    // Contexte 2D avec desynchronized pour réduire la latence d'affichage au minimum
     const ctx = canvas.getContext('2d', {
       alpha: false,
       desynchronized: true,
@@ -146,11 +131,13 @@ export const VideoCropper: React.FC<VideoCropperProps> = ({
     });
     if (!ctx) return;
 
+    if (!cleanSnapshotCanvasRef.current) {
+      cleanSnapshotCanvasRef.current = document.createElement('canvas');
+    }
+
     let isMounted = true;
     let frameCallbackId: number | null = null;
     let animFrameId: number | null = null;
-
-    // Dernières dimensions connues du canvas pour éviter des redimensionnements inutiles
     let lastCanvasWidth = 0;
     let lastCanvasHeight = 0;
 
@@ -167,12 +154,10 @@ export const VideoCropper: React.FC<VideoCropperProps> = ({
         const vw = currentVideo.videoWidth;
         const vh = currentVideo.videoHeight;
 
-        // Calcul de la zone source avec exclusion optionnelle du bandeau inférieur (bottomSafety)
         const currentCrop = cropRef.current;
         const safetyFactor = Math.max(0, Math.min(0.3, bottomSafetyRef.current / 100));
         const effectiveVh = vh * (1 - safetyFactor);
 
-        // Conversion des pourcentages en coordonnées de pixels natifs de la vidéo
         const normCrop = {
           x: (Math.max(0, Math.min(95, currentCrop.x)) / 100) * vw,
           y: (Math.max(0, Math.min(95, currentCrop.y)) / 100) * effectiveVh,
@@ -180,13 +165,11 @@ export const VideoCropper: React.FC<VideoCropperProps> = ({
           h: (Math.max(5, Math.min(100, currentCrop.height)) / 100) * effectiveVh,
         };
 
-        // Clamping strict pour ne jamais déborder de la source vidéo
         const sx = Math.max(0, Math.min(vw - 1, normCrop.x));
         const sy = Math.max(0, Math.min(effectiveVh - 1, normCrop.y));
         const sw = Math.max(1, Math.min(vw - sx, normCrop.w));
         const sh = Math.max(1, Math.min(effectiveVh - sy, normCrop.h));
 
-        // Ajustement des dimensions internes du canvas uniquement si elles ont changé
         const targetWidth = Math.round(sw);
         const targetHeight = Math.round(sh);
 
@@ -197,22 +180,48 @@ export const VideoCropper: React.FC<VideoCropperProps> = ({
           lastCanvasHeight = targetHeight;
           ctx.imageSmoothingEnabled = true;
           ctx.imageSmoothingQuality = 'high';
+
+          if (cleanSnapshotCanvasRef.current) {
+            cleanSnapshotCanvasRef.current.width = targetWidth;
+            cleanSnapshotCanvasRef.current.height = targetHeight;
+          }
         }
 
-        // Rendu naturel direct : AUCUN rectangle noir, aucun flou dégradant, zéro altération
         ctx.drawImage(currentVideo, sx, sy, sw, sh, 0, 0, targetWidth, targetHeight);
 
-        // Transmission du callback sans bloquer
+        const activeWm = watermarkBoxRef.current;
+        const enableRecon = enableReconRef.current;
+        const cleanCanvas = cleanSnapshotCanvasRef.current;
+
+        if (!activeWm) {
+          if (enableRecon && cleanCanvas) {
+            const cleanCtx = cleanCanvas.getContext('2d');
+            if (cleanCtx) {
+              cleanCtx.drawImage(canvas, 0, 0);
+              hasCleanSnapshotRef.current = true;
+            }
+          }
+        } else if (activeWm && enableRecon && hasCleanSnapshotRef.current && cleanCanvas) {
+          const wx = (activeWm.x / 100) * targetWidth;
+          const wy = (activeWm.y / 100) * targetHeight;
+          const ww = (activeWm.width / 100) * targetWidth;
+          const wh = (activeWm.height / 100) * targetHeight;
+
+          ctx.save();
+          ctx.beginPath();
+          ctx.rect(wx, wy, ww, wh);
+          ctx.clip();
+          ctx.drawImage(cleanCanvas, wx, wy, ww, wh, wx, wy, ww, wh);
+          ctx.restore();
+        }
+
         if (onFrameRef.current) {
           try {
             onFrameRef.current(now, metadata);
-          } catch {
-            // Empêche toute interruption du flux d'affichage en cas d'exception dans onFrame
-          }
+          } catch {}
         }
       }
 
-      // Planification de la frame suivante via requestVideoFrameCallback (ou rAF)
       if (currentVideo && 'requestVideoFrameCallback' in currentVideo) {
         frameCallbackId = currentVideo.requestVideoFrameCallback(renderLoop);
       } else {
@@ -220,7 +229,6 @@ export const VideoCropper: React.FC<VideoCropperProps> = ({
       }
     };
 
-    // Démarrage de la boucle de rendu
     const activeVideo = videoRef.current;
     if (activeVideo && 'requestVideoFrameCallback' in activeVideo) {
       frameCallbackId = activeVideo.requestVideoFrameCallback(renderLoop);
@@ -240,7 +248,6 @@ export const VideoCropper: React.FC<VideoCropperProps> = ({
     };
   }, [video]);
 
-  // Gestion du drag and drop pour ajuster le crop interactivement si lockCrop = false
   const handleMouseDown = (action: 'move' | 'nw' | 'ne' | 'se' | 'sw', e: React.MouseEvent) => {
     if (lockCrop || !setCrop) return;
     e.preventDefault();
@@ -328,14 +335,12 @@ export const VideoCropper: React.FC<VideoCropperProps> = ({
       className={`relative overflow-hidden flex items-center justify-center select-none ${className}`}
       style={{ touchAction: 'none' }}
     >
-      {/* Canvas haute performance de rendu natif */}
       <canvas
         ref={canvasRef}
         className="w-full h-full object-contain pointer-events-none"
         style={{ imageRendering: 'auto' }}
       />
 
-      {/* Cadre de recadrage interactif (affiché uniquement si non verrouillé et éditable) */}
       {!lockCrop && setCrop && (
         <div
           className="absolute border-2 border-emerald-400 bg-emerald-500/10 cursor-move transition-shadow shadow-[0_0_15px_rgba(52,211,153,0.3)]"
@@ -347,7 +352,6 @@ export const VideoCropper: React.FC<VideoCropperProps> = ({
           }}
           onMouseDown={(e) => handleMouseDown('move', e)}
         >
-          {/* Poignées de redimensionnement aux coins */}
           <div
             className="absolute -top-1.5 -left-1.5 w-3 h-3 bg-white border border-emerald-500 rounded-sm cursor-nwse-resize shadow"
             onMouseDown={(e) => handleMouseDown('nw', e)}
@@ -365,7 +369,6 @@ export const VideoCropper: React.FC<VideoCropperProps> = ({
             onMouseDown={(e) => handleMouseDown('se', e)}
           />
 
-          {/* Grille de composition discrète (règle des tiers) */}
           <div className="absolute inset-0 grid grid-cols-3 grid-rows-3 pointer-events-none opacity-20">
             <div className="border-r border-b border-white/60" />
             <div className="border-r border-b border-white/60" />
